@@ -46,12 +46,11 @@ export async function* prepareAudioParts(
     return;
   }
   const scan = await run(ffmpeg, [
-    "-nostdin", "-v", "error", "-i", source, "-map", "0:a:0",
-    "-af", "silencedetect=noise=-35dB:d=0.3,ametadata=mode=print:file=-",
-    "-progress", "pipe:2", "-f", "null", "-",
+    "-nostdin", "-hide_banner", "-nostats", "-v", "info", "-i", source, "-map", "0:a:0",
+    "-af", "aresample=16000,asetpts=N/SR/TB,silencedetect=noise=-35dB:d=0.3,ametadata=mode=print:file=-,astats=measure_perchannel=none:measure_overall=Number_of_samples",
+    "-f", "null", "-",
   ], { timeout: remainingMs(deadline), maxBuffer: 16 * 1024 * 1024 });
-  const times = [...scan.stderr.matchAll(/^out_time_us=(\d+)$/gm)];
-  const duration = Number(times.at(-1)?.[1]) / 1_000_000;
+  const duration = Number(scan.stderr.match(/Number of samples:\s*(\d+)/)?.[1]) / 16000;
   if (!Number.isFinite(duration) || duration <= 0) throw new Error("ffmpeg decoded no audio");
   const silences: Silence[] = [];
   let pauseStart: number | undefined;
@@ -72,8 +71,8 @@ export async function* prepareAudioParts(
     for (const [index, range] of planAudioRanges(duration, silences).entries()) {
       const path = join(directory, `${index}.wav`);
       await run(ffmpeg, [
-        "-nostdin", "-v", "error", "-i", source, "-ss", String(range.startSeconds),
-        "-t", String(range.endSeconds - range.startSeconds), "-map", "0:a:0",
+        "-nostdin", "-v", "error", "-i", source, "-map", "0:a:0",
+        "-af", `aresample=16000,atrim=start_sample=${Math.round(range.startSeconds * 16000)}:end_sample=${Math.round(range.endSeconds * 16000)},asetpts=PTS-STARTPTS`,
         "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", path,
       ], { timeout: remainingMs(deadline) });
       try {

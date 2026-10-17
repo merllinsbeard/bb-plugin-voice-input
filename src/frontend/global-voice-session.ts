@@ -446,7 +446,7 @@ export class GlobalVoiceSession {
       this.updateSnapshot({ state: "idle", target: null });
       const msg =
         err instanceof DOMException && err.name === "AbortError"
-          ? "Таймаут распознавания речи (сервер не ответил за 60 секунд)"
+          ? "Таймаут распознавания речи"
           : err instanceof Error
             ? err.message
             : String(err);
