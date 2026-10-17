@@ -4,6 +4,7 @@
 // BB выбирает голосовой сервис в Settings → AI services (задача voice).
 // Плагин регистрирует сервис «local-voice» с transcribe() и реализует
 // распознавание в host.ts; здесь живут настройки, CLI и доставка на машины.
+import { TRANSCRIBE_TIMEOUT_MS } from "./src/transcription-budget.js";
 import { type BbPluginApi } from "@get-bb/plugin-sdk";
 import { readFile } from "node:fs/promises";
 import { hostname } from "node:os";
@@ -31,8 +32,6 @@ import {
 const CONFIG_PUSH_DELAY_MS = 2_000;
 /** Установка тянет пакеты и модель: полчаса — потолок, а не ожидание. */
 const SETUP_TIMEOUT_MS = 30 * 60 * 1000;
-/** Длинная запись плюс возможная первая загрузка модели. */
-const TRANSCRIBE_TIMEOUT_MS = 10 * 60 * 1000;
 /** Модель может весить гигабайты, а канал — быть узким. */
 const DOWNLOAD_TIMEOUT_MS = 60 * 60 * 1000;
 /** Env Catalog — необязательный плагин: если он стоит, ключ можно взять из него. */

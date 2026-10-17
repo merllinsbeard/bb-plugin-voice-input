@@ -3,7 +3,6 @@
 // Они не требуют ни Python, ни моделей на диске, но аудио уходит наружу —
 // в отличие от локальных движков. Выбор между скоростью установки и
 // приватностью остаётся за пользователем и виден прямо в настройках.
-import { Blob } from "node:buffer";
 
 export type CloudCredentials = {
   baseUrl: string;
@@ -36,6 +35,37 @@ function languageCode(language: string): string | null {
   return null;
 }
 
+export class CloudError extends Error {
+  readonly transient: boolean;
+  readonly retryAfterMs?: number;
+
+  constructor(message: string, transient: boolean, retryAfterMs?: number) {
+    super(message);
+    this.transient = transient;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+export function cloudHttpError(status: number, payload: unknown, retryAfter: string | null): CloudError {
+  const error = asObject(asObject(payload)?.error);
+  const quota = error?.code === "insufficient_quota" || error?.type === "insufficient_quota";
+  const seconds = retryAfter === null ? NaN : Number(retryAfter);
+  const wait = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(retryAfter ?? "") - Date.now();
+  return new CloudError(`Cloud HTTP ${status}: ${errorMessage(payload)}`,
+    !quota && (status === 408 || status === 429 || status >= 500 && status <= 599),
+    Number.isFinite(wait) ? Math.max(0, wait) : undefined);
+}
+
+async function fetchJson(url: string, init: RequestInit): Promise<unknown> {
+  const response = await fetch(url, init);
+  const payload: unknown = await response.json().catch((error: unknown) => {
+    if (error instanceof SyntaxError && !init.signal?.aborted) return null;
+    throw error;
+  });
+  if (!response.ok) throw cloudHttpError(response.status, payload, response.headers.get("retry-after"));
+  return payload;
+}
+
 async function withTimeout<T>(
   timeoutMs: number,
   run: (signal: AbortSignal) => Promise<T>,
@@ -46,8 +76,9 @@ async function withTimeout<T>(
     return await run(controller.signal);
   } catch (error) {
     if (controller.signal.aborted) {
-      throw new Error("timeout");
+      throw new CloudError("timeout", true);
     }
+    if (error instanceof TypeError) throw new CloudError("Cloud network error", true);
     throw error;
   } finally {
     clearTimeout(timer);
@@ -59,34 +90,29 @@ export async function transcribeOpenAi(
   credentials: CloudCredentials,
   request: CloudRequest,
 ): Promise<string> {
-  const form = new FormData();
-  form.set("model", credentials.model);
-  form.set("file", new Blob([request.audio], { type: request.mimeType }), request.filename);
-  if (request.language !== "auto") {
-    form.set("language", request.language);
-  }
-  if (request.prompt) {
-    form.set("prompt", request.prompt);
-  }
+  return withTimeout(request.timeoutMs, async (signal) => {
+    const form = new FormData();
+    form.set("model", credentials.model);
+    form.set("file", new Blob([new Uint8Array(request.audio)], { type: request.mimeType }), request.filename);
+    if (request.language !== "auto") {
+      form.set("language", request.language);
+    }
+    if (request.prompt) {
+      form.set("prompt", request.prompt);
+    }
 
-  const response = await withTimeout(request.timeoutMs, (signal) =>
-    fetch(`${trimSlash(credentials.baseUrl)}/audio/transcriptions`, {
+    const payload = await fetchJson(`${trimSlash(credentials.baseUrl)}/audio/transcriptions`, {
       method: "POST",
       headers: { authorization: `Bearer ${credentials.apiKey}` },
       body: form,
       signal,
-    }),
-  );
-
-  const payload: unknown = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new Error(`OpenAI ответил HTTP ${response.status}: ${errorMessage(payload)}`);
-  }
-  const text = readString(payload, "text");
-  if (text === null) {
-    throw new Error("OpenAI вернул ответ без текста");
-  }
-  return text.trim();
+    });
+    const text = readString(payload, "text");
+    if (text === null) {
+      throw new Error("OpenAI вернул ответ без текста");
+    }
+    return text.trim();
+  });
 }
 
 /**
@@ -100,57 +126,47 @@ export async function transcribeGemini(
   credentials: CloudCredentials,
   request: CloudRequest,
 ): Promise<string> {
-  const base = trimSlash(credentials.baseUrl);
-  const headers = { "x-goog-api-key": credentials.apiKey };
+  return withTimeout(request.timeoutMs, async (signal) => {
+    const base = trimSlash(credentials.baseUrl);
+    const headers = { "x-goog-api-key": credentials.apiKey };
 
-  if (!credentials.model.includes("transcribe")) {
-    return await transcribeGeminiInline(base, headers, credentials, request);
-  }
+    if (!credentials.model.includes("transcribe")) {
+      return await transcribeGeminiInline(base, headers, credentials, request, signal);
+    }
 
-  const uploaded = await withTimeout(request.timeoutMs, (signal) =>
-    fetch(`${base}/upload/v1beta/files?uploadType=media`, {
+    const uploadPayload = await fetchJson(`${base}/upload/v1beta/files?uploadType=media`, {
       method: "POST",
       headers: { ...headers, "content-type": request.mimeType },
       body: new Uint8Array(request.audio),
       signal,
-    }),
-  );
-  const uploadPayload: unknown = await uploaded.json().catch(() => null);
-  if (!uploaded.ok) {
-    throw new Error(`Google не принял файл, HTTP ${uploaded.status}: ${errorMessage(uploadPayload)}`);
-  }
-  const fileUri = readNestedString(uploadPayload, ["file", "uri"]);
-  if (!fileUri) {
-    throw new Error("Google не вернул ссылку на загруженный файл");
-  }
+    });
+    const fileUri = readNestedString(uploadPayload, ["file", "uri"]);
+    if (!fileUri) {
+      throw new Error("Google не вернул ссылку на загруженный файл");
+    }
 
-  const code = languageCode(request.language);
-  const body: Record<string, unknown> = {
-    model: credentials.model,
-    input: [{ type: "audio", uri: fileUri, mime_type: request.mimeType }],
-  };
-  if (code) {
-    body.generation_config = { transcription_config: { language_codes: [code] } };
-  }
+    const code = languageCode(request.language);
+    const body: Record<string, unknown> = {
+      model: credentials.model,
+      input: [{ type: "audio", uri: fileUri, mime_type: request.mimeType }],
+    };
+    if (code) {
+      body.generation_config = { transcription_config: { language_codes: [code] } };
+    }
 
-  const response = await withTimeout(request.timeoutMs, (signal) =>
-    fetch(`${base}/v1beta/interactions`, {
+    const payload = await fetchJson(`${base}/v1beta/interactions`, {
       method: "POST",
       headers: { ...headers, "content-type": "application/json" },
       body: JSON.stringify(body),
       signal,
-    }),
-  );
-  const payload: unknown = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new Error(`Google ответил HTTP ${response.status}: ${errorMessage(payload)}`);
-  }
-  const text =
-    readNestedString(payload, ["interaction", "output_text"]) ?? readString(payload, "output_text");
-  if (text === null) {
-    throw new Error("Google вернул ответ без текста");
-  }
-  return text.trim();
+    });
+    const text =
+      readNestedString(payload, ["interaction", "output_text"]) ?? readString(payload, "output_text");
+    if (text === null) {
+      throw new Error("Google вернул ответ без текста");
+    }
+    return text.trim();
+  });
 }
 
 async function transcribeGeminiInline(
@@ -158,6 +174,7 @@ async function transcribeGeminiInline(
   headers: Record<string, string>,
   credentials: CloudCredentials,
   request: CloudRequest,
+  signal: AbortSignal,
 ): Promise<string> {
   const instruction = [
     "Запиши дословную расшифровку речи из аудио.",
@@ -167,34 +184,27 @@ async function transcribeGeminiInline(
     .filter(Boolean)
     .join(" ");
 
-  const response = await withTimeout(request.timeoutMs, (signal) =>
-    fetch(`${base}/v1beta/models/${credentials.model}:generateContent`, {
-      method: "POST",
-      headers: { ...headers, "content-type": "application/json" },
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [
-              { text: instruction },
-              {
-                inline_data: {
-                  mime_type: request.mimeType,
-                  data: request.audio.toString("base64"),
-                },
+  const payload = await fetchJson(`${base}/v1beta/models/${credentials.model}:generateContent`, {
+    method: "POST",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify({
+      contents: [
+        {
+          parts: [
+            { text: instruction },
+            {
+              inline_data: {
+                mime_type: request.mimeType,
+                data: request.audio.toString("base64"),
               },
-            ],
-          },
-        ],
-        generationConfig: { temperature: 0 },
-      }),
-      signal,
+            },
+          ],
+        },
+      ],
+      generationConfig: { temperature: 0 },
     }),
-  );
-
-  const payload: unknown = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new Error(`Google ответил HTTP ${response.status}: ${errorMessage(payload)}`);
-  }
+    signal,
+  });
   const parts = readParts(payload);
   if (parts === null) {
     throw new Error("Google вернул ответ без текста");

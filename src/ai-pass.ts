@@ -48,6 +48,11 @@ export function stripReasoning(value: string): string {
   return out.trim();
 }
 
+export function aiPassBudget(textLength: number): { maxTokens: number; timeoutMs: number } {
+  const maxTokens = Math.max(4096, Math.ceil(textLength / 2));
+  return { maxTokens, timeoutMs: Math.ceil(30_000 * maxTokens / 4096) };
+}
+
 export async function runAiPass(
   text: string,
   options: AiPassOptions,
@@ -59,8 +64,9 @@ export async function runAiPass(
     return text;
   }
 
+  const budget = aiPassBudget(text.length);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), options.timeoutMs);
+  const timer = setTimeout(() => controller.abort(), Math.min(options.timeoutMs, budget.timeoutMs));
   try {
     const response = await fetchImpl(`${trimTrailingSlash(options.baseUrl)}/chat/completions`, {
       method: "POST",
@@ -71,7 +77,7 @@ export async function runAiPass(
       body: JSON.stringify({
         model: options.model,
         temperature: 0,
-        max_completion_tokens: 4096,
+        max_completion_tokens: budget.maxTokens,
         messages: [{ role: "user", content: prompt }],
       }),
       signal: controller.signal,
@@ -81,14 +87,8 @@ export async function runAiPass(
       throw new Error(`ИИ-проход вернул HTTP ${response.status}`);
     }
     const payload: unknown = await response.json();
-    const content = readContent(payload);
-    if (!content) {
-      throw new Error("ИИ-проход вернул пустой ответ");
-    }
-    const cleaned = stripReasoning(content);
-    // Пустой результат после вычистки означает, что модель прислала одни
-    // рассуждения: текст после правил лучше, чем ничего.
-    return cleaned.length > 0 ? cleaned : text;
+    controller.signal.throwIfAborted();
+    return completedAiText(payload);
   } finally {
     clearTimeout(timer);
   }
@@ -98,14 +98,20 @@ function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/u, "");
 }
 
-function readContent(payload: unknown): string | null {
+export function completedAiText(payload: unknown): string {
   if (!payload || typeof payload !== "object") {
-    return null;
+    throw new Error("ИИ-проход вернул некорректный ответ");
   }
   const choices = (payload as { choices?: unknown }).choices;
-  if (!Array.isArray(choices) || choices.length === 0) {
-    return null;
+  const first: unknown = Array.isArray(choices) ? choices[0] : undefined;
+  if (!first || typeof first !== "object" ||
+      (first as { finish_reason?: unknown }).finish_reason !== "stop") {
+    throw new Error("ИИ-проход не завершён полностью");
   }
-  const message = (choices[0] as { message?: { content?: unknown } }).message;
-  return typeof message?.content === "string" ? message.content : null;
+  const message = (first as { message?: unknown }).message;
+  const content = message && typeof message === "object"
+    ? (message as { content?: unknown }).content : undefined;
+  const cleaned = typeof content === "string" ? stripReasoning(content) : "";
+  if (!cleaned) throw new Error("ИИ-проход вернул пустой ответ");
+  return cleaned;
 }
