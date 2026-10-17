@@ -25,12 +25,15 @@ import { engineReady, findFfmpeg, findPython, setupEngine } from "./src/setup.js
 import { buildRecognitionPrompt, parseVocabulary } from "./src/vocabulary.js";
 import { cleanupText } from "./src/cleanup.js";
 import { repairTerms } from "./src/term-repair.js";
+import { TRANSCRIBE_TIMEOUT_MS } from "./src/transcription-budget.js";
+import { remainingMs, suppressPromptEcho, transcribeCloudAudio } from "./src/long-audio.js";
 import { runAiPass } from "./src/ai-pass.js";
 import { guardAiPass } from "./src/ai-pass-guard.js";
-import { transcribeGemini, transcribeOpenAi } from "./src/cloud.js";
+import { type CloudRequest, transcribeGemini, transcribeOpenAi } from "./src/cloud.js";
 
 const DEFAULT_CONFIG: VoiceConfig = {
   engine: "whisper",
+  machine: "",
   whisperModel: "mlx-community/whisper-large-v3-turbo",
   language: "auto",
   vocabulary: "",
@@ -59,7 +62,6 @@ const DEFAULT_CONFIG: VoiceConfig = {
 
 /** Подсказка Whisper читается моделью лишь частично — держим бюджет Voica. */
 const PROMPT_BUDGET_CHARS = 800;
-const AI_PASS_TIMEOUT_MS = 30_000;
 /**
  * Через сколько секунд тишины демон выгружает модель и выходит. Модель весит
  * гигабайты и на машине сервера соседствует с тредами — тёплый старт того не
@@ -194,6 +196,7 @@ async function postprocess(
   rawText: string,
   config: VoiceConfig,
   log: (message: string) => void,
+  deadline: number,
 ): Promise<string> {
   const entries = parseVocabulary(config.vocabulary);
   let text = rawText;
@@ -216,7 +219,7 @@ async function postprocess(
         model: config.aiPass.model,
         apiKey: aiPassKey,
         vocabulary: entries,
-        timeoutMs: AI_PASS_TIMEOUT_MS,
+        timeoutMs: remainingMs(deadline),
       });
       // Модель иногда переписывает обычные слова вопреки промпту.
       text = guardAiPass(text, corrected, entries);
@@ -268,6 +271,7 @@ async function runTranscription(
   args: { audioPath: string; savedPath: string | null; prompt: string | null; timeoutMs: number },
 ): Promise<TranscriptionOutcome> {
   const started = Date.now();
+  const deadline = started + args.timeoutMs;
   let rawText: string;
 
   const entries = parseVocabulary(config.vocabulary);
@@ -280,16 +284,7 @@ async function runTranscription(
     config.engine === "google" ||
     config.engine === "groq"
   ) {
-    // Облачные движки читают файл с диска и отправляют его наружу.
-    const audio = await readFile(args.audioPath);
-    const request = {
-      audio,
-      filename: basename(args.audioPath),
-      mimeType: mimeTypeFor(args.audioPath),
-      language: config.language,
-      prompt: hint,
-      timeoutMs: args.timeoutMs,
-    };
+    let transcribe: (request: CloudRequest) => Promise<string>;
     if (config.engine === "openai" || config.engine === "groq") {
       const groq = config.engine === "groq";
       const key = groq
@@ -303,7 +298,7 @@ async function runTranscription(
             : `Для движка ${groq ? "Groq" : "OpenAI"} нужен ключ: Настройки → Голосовой ввод → Облако.`,
         );
       }
-      rawText = await transcribeOpenAi(
+      transcribe = (request) => transcribeOpenAi(
         {
           baseUrl: groq ? config.cloud.groqBaseUrl : config.cloud.openaiBaseUrl,
           apiKey: key,
@@ -320,7 +315,7 @@ async function runTranscription(
             : "Для движка Google нужен ключ: Настройки → Голосовой ввод → Облако.",
         );
       }
-      rawText = await transcribeGemini(
+      transcribe = (request) => transcribeGemini(
         {
           baseUrl: config.cloud.googleBaseUrl,
           apiKey: key,
@@ -329,6 +324,15 @@ async function runTranscription(
         request,
       );
     }
+    rawText = await transcribeCloudAudio(args.audioPath, await findFfmpeg(), deadline, hint,
+      async (part, timeoutMs) => transcribe({
+        audio: await readFile(part.path),
+        filename: basename(part.path),
+        mimeType: part.converted ? "audio/wav" : mimeTypeFor(part.path),
+        language: config.language,
+        prompt: hint,
+        timeoutMs: Math.min(timeoutMs, remainingMs(deadline)),
+      }));
   } else {
     await ensureDaemon(paths, config.engine, DAEMON_IDLE_SECONDS);
     const response = await callDaemon(
@@ -350,17 +354,8 @@ async function runTranscription(
     rawText = response.text ?? "";
   }
 
-  // Защита от галлюцинаций Whisper при тишине на записи:
-  // если модель просто повторила подсказку словаря
-  if (hint && rawText.trim().length > 0) {
-    const normRaw = rawText.replace(/[,.\s]/g, "").toLowerCase();
-    const normHint = hint.replace(/[,.\s]/g, "").toLowerCase();
-    if (normRaw === normHint) {
-      rawText = "";
-    }
-  }
-
-  const text = await postprocess(rawText, config, () => {});
+  rawText = suppressPromptEcho(rawText, hint);
+  const text = await postprocess(rawText, config, () => {}, deadline);
   if (!text.trim()) {
     throw new Error("Речь не обнаружена (тишина на записи)");
   }
@@ -390,14 +385,14 @@ async function executeAudioTranscription(
     audioBase64: string;
     mimeType: string;
     filename?: string;
-    prompt?: string;
+    prompt?: string | null;
     timeoutMs?: number;
   },
   tempDir: string,
 ): Promise<{ ok: true; model: string; text: string } | { ok: false; code: "timeout" | "request_failed"; message: string }> {
   const config = await readConfigWithSecrets(paths);
   const audio = Buffer.from(input.audioBase64, "base64");
-  const extension = extensionFor(input.filename, input.mimeType);
+  const extension = extensionFor(input.filename ?? "", input.mimeType);
 
   const savedPath = config.saveRecordings
     ? await keepRecording(paths, audio, extension)
@@ -414,8 +409,8 @@ async function executeAudioTranscription(
     const outcome = await runTranscription(paths, config, {
       audioPath,
       savedPath,
-      prompt: input.prompt,
-      timeoutMs: input.timeoutMs,
+      prompt: input.prompt ?? null,
+      timeoutMs: input.timeoutMs ?? TRANSCRIBE_TIMEOUT_MS,
     });
     return { ok: true as const, model: outcome.engine, text: outcome.text };
   } catch (error) {

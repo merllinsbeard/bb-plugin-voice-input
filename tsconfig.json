@@ -23,6 +23,8 @@
   },
   "include": [
     "server.ts",
+    "host.ts",
+    "src",
     "app.tsx",
     "components",
     "lib",

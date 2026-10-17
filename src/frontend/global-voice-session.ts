@@ -2,6 +2,7 @@
 // Живёт на уровне окна приложения (App-level singleton) и не зависит
 // от смены вкладок, роутинга или размонтирования компонентов PromptBox.
 
+import { TRANSCRIBE_RESPONSE_TIMEOUT_MS } from "../transcription-budget.ts";
 import { toast } from "sonner";
 import {
   findComposerEditor,
@@ -392,7 +393,7 @@ export class GlobalVoiceSession {
         this.transcribeFn ||
         (async (data) => {
           const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 60_000);
+          const timer = setTimeout(() => controller.abort(), TRANSCRIBE_RESPONSE_TIMEOUT_MS);
           try {
             const res = await fetch("/api/v1/plugins/voice-input/rpc/transcribeAudio", {
               method: "POST",
@@ -445,7 +446,7 @@ export class GlobalVoiceSession {
       this.updateSnapshot({ state: "idle", target: null });
       const msg =
         err instanceof DOMException && err.name === "AbortError"
-          ? "Таймаут распознавания речи (сервер не ответил за 60 секунд)"
+          ? "Таймаут распознавания речи"
           : err instanceof Error
             ? err.message
             : String(err);
